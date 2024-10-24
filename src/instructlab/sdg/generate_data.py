@@ -269,7 +269,7 @@ def _mixer_init(ctx, output_dir, date_suffix, knowledge_auxiliary_inst):
 # TODO - parameter removal needs to be done in sync with a CLI change.
 # to be removed: logger, prompt_file_path, rouge_threshold, tls_*
 def generate_data(
-    clients: list[openai.OpenAI],
+    client: openai.OpenAI,
     logger: logging.Logger = logger,  # pylint: disable=redefined-outer-name
     model_family: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -289,6 +289,8 @@ def generate_data(
     pipeline: Optional[str] = "simple",
     batch_size: Optional[int] = None,
     checkpoint_dir: Optional[str] = None,
+    thread: Optional[int] = None,
+    total_threads: Optional[int] = None
 ) -> None:
     """Generate data for training and testing a model.
 
@@ -338,27 +340,6 @@ def generate_data(
     else:
         model_family = MODEL_FAMILY_MERLINITE
 
-    ctx = _context_init(
-        clients[0],
-        model_family,
-        model_name,
-        num_instructions_to_generate,
-        checkpoint_dir,
-        1,  # save_freq
-        batch_size=batch_size,
-        batch_num_workers=num_cpus,
-    )
-
-    knowledge_pipe, freeform_skills_pipe, grounded_skills_pipe = _sdg_init(
-        ctx, pipeline
-    )
-
-    # Make sure checkpointing is disabled (we don't want this pipeline to load checkpoints from the main pipeline)
-    mmlu_ctx = dataclasses.replace(ctx, checkpoint_dir=None)
-    mmlu_bench_pipe = mmlubench_pipe_init(mmlu_ctx)
-
-    mixer = _mixer_init(ctx, output_dir, date_suffix, knowledge_pipe.auxiliary_inst)
-
     if console_output:
         logger.info(
             "Synthesizing new instructions. If you aren't satisfied with the generated instructions, interrupt training (Ctrl-C) and try adjusting your YAML files. Adding more examples may help."
@@ -397,10 +378,11 @@ def generate_data(
         # 2. execute a thread running each batch in its own pipeline
         # 3. add the data back together
         # 4. return that data.
-        if len(clients) > 1:
-            new_generated_data = generate_on_multiple_servers(
+        if thread is not None:
+            print(f"threading with {total_threads} this is thread {thread}")
+            new_generated_data = generate_on_multiple_threads(
                 ds,
-                clients,
+                client,
                 checkpoint_dir,
                 model_family,
                 model_name,
@@ -413,8 +395,40 @@ def generate_data(
                 pipeline,
                 leaf_node_path,
                 num_cpus,
+                thread,
+                total_threads,
             )
         else:
+            ctx = _context_init(
+                client,
+                model_family,
+                model_name,
+                num_instructions_to_generate,
+                checkpoint_dir,
+                1,  # save_freq
+                batch_size=batch_size,
+                batch_num_workers=num_cpus,
+            )
+
+            knowledge_pipe, freeform_skills_pipe, grounded_skills_pipe = _sdg_init(
+                ctx, pipeline
+            )
+            if samples[0].get("document"):
+                is_knowledge = True
+
+            elif samples[0].get("seed_context"):
+                is_g_skill = True
+                pipe = grounded_skills_pipe
+
+            else:
+                is_f_skill = True
+                pipe = freeform_skills_pipe
+
+
+                # Make sure checkpointing is disabled (we don't want this pipeline to load checkpoints from the main pipeline)
+            mmlu_ctx = dataclasses.replace(ctx, checkpoint_dir=None)
+            mmlu_bench_pipe = mmlubench_pipe_init(mmlu_ctx)
+
             new_generated_data = pipe.generate(ds, leaf_node_path)
             if len(new_generated_data) == 0:
                 empty_sdg_leaf_nodes.append(leaf_node_path)
@@ -437,6 +451,7 @@ def generate_data(
                     output_dir,
                     date_suffix,
                 )
+    mixer = _mixer_init(ctx, output_dir, date_suffix, knowledge_pipe.auxiliary_inst)
 
     mixer.collect(leaf_node_path, new_generated_data, is_knowledge)
 
@@ -469,6 +484,7 @@ def process_llama_server_batch(
     pipeline,
     leaf_node_path,
     thread,
+    total_threads,
 ):
     logger.info(f"Running on client {client.base_url} {model_name} ")
     ctx = _context_init(
@@ -509,9 +525,9 @@ def process_llama_server_batch(
     return new_data
 
 
-def generate_on_multiple_servers(
+def generate_on_multiple_threads(
     ds,
-    clients,
+    client,
     checkpoint_dir,
     model_family,
     model_name,
@@ -524,58 +540,63 @@ def generate_on_multiple_servers(
     pipeline,
     leaf_node_path,
     num_cpus,
+    thread,
+    total_threads,
 ):
     # num batches == num clients
     total_size = len(ds)
 
-    batch_size = math.ceil(total_size / len(clients))
+    batch_size = math.ceil(total_size / total_threads)
 
     # Create a batch for each client using ds.select() and indices
     batches = [
         ds.select(range(i * batch_size, min((i + 1) * batch_size, total_size)))
-        for i in range(len(clients))
+        for i in range(total_threads)
     ]
     # batches will be the same as the number of clients.
 
-    checkpointer = Checkpointer(checkpoint_dir, 1)
-    output_splits = []
+    # only gen for our specific thread.
+    ds = batches[thread]
 
-    logger.debug(f" batches {len(batches)}, clients {len(clients)}, {clients}")
+    print(ds)
+    print(f" batches {len(batches)}, clients {total_threads}, current client {thread}")
+
+    logger.debug(f" batches {len(batches)}, clients {total_threads}, current client {thread}")
     # Using ThreadPoolExecutor to process each (ds, client) pair in parallel
-    with ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(
-                process_llama_server_batch,
-                ds,
-                client,
-                model_family,
-                model_name,
-                num_instructions_to_generate,
-                checkpoint_dir,
-                0,
-                num_cpus / len(clients),
-                output_dir,
-                date_suffix,
-                is_knowledge,
-                is_g_skill,
-                is_f_skill,
-                pipeline,
-                leaf_node_path,
-                thread,
-            )
-            for thread, (ds, client) in enumerate(zip(batches, clients))
-        ]
-        for i, future in enumerate(futures):
-            if future.running():
-                logger.debug(f"Thread {i} is running")
-            elif future.done():
-                logger.debug(f"Thread {i} has completed")
-            elif future.cancelled():
-                logger.debug(f"Thread {i} was canceled")
-        for future in futures:
-            new_data = future.result()
-            output_splits.append(new_data)
-            checkpointer.checkpoint(new_data)
-    concatenate_datasets(output_splits)
-    logger.debug("Dataset: %s", output_splits)
-    return output_splits
+    logger.info(f"Running on client {client.base_url} {model_name} ")
+    ctx = _context_init(
+        client,
+        model_family,
+        model_name,
+        num_instructions_to_generate,
+        checkpoint_dir,
+        1,  # save_freq
+        batch_size=0,
+        batch_num_workers=num_cpus,
+    )
+
+    knowledge_pipe, freeform_skills_pipe, grounded_skills_pipe = _sdg_init(
+        ctx, pipeline
+    )
+    mmlu_ctx = dataclasses.replace(ctx, checkpoint_dir=None)
+    mmlu_bench_pipe = mmlubench_pipe_init(mmlu_ctx)
+    logger.debug("Dataset: %s", ds)
+    pipe = None
+    if is_knowledge:
+        pipe = knowledge_pipe
+    elif is_g_skill:
+        pipe = grounded_skills_pipe
+    elif is_f_skill:
+        pipe = freeform_skills_pipe
+
+    new_data = pipe.generate(ds, leaf_node_path, thread=thread)
+
+    if is_knowledge:
+        generate_eval_task_data(
+            mmlu_bench_pipe,
+            leaf_node_path,
+            ds,
+            output_dir,
+            date_suffix,
+        )
+    return new_data

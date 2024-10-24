@@ -132,13 +132,14 @@ class Pipeline:
             pipeline_yaml = os.path.join(resources.files(__package__), pipeline_yaml)
         return cls(ctx, pipeline_yaml, *_parse_pipeline_config_file(pipeline_yaml))
 
-    def generate(self, dataset, checkpoint_name=None, thread: int = 0) -> Dataset:
+    def generate(self, dataset, checkpoint_name=None, thread: int | None = 0) -> Dataset:
         """
         Generate the dataset by running the pipeline steps.
         dataset: the input dataset
         checkpoint_name: unique subdir name for the checkpoint within checkpoint_dir
         """
 
+        print(f"generating on thread {thread}")
         # The checkpointer allows us to resume from where we left off
         # Saving the output of pipe instances along the way
         checkpoint_dir = None
@@ -182,7 +183,7 @@ class Pipeline:
 
     ## Implementation Details ##
 
-    def _generate_single(self, dataset, thread: int = None) -> Dataset:
+    def _generate_single(self, dataset, thread: int | None = None) -> Dataset:
         """Generate a single dataset by running the pipeline steps."""
         for block_prop in self.chained_blocks:
             # Initialize arguments for error handling to None
@@ -200,6 +201,7 @@ class Pipeline:
 
                 # Execute the block and wrap errors with the block name/type
                 if block_type == llmblock.LLMBlock:
+                    print(f"passing thread {thread} to LLM Block")
                     dataset = block.generate(dataset, thread)
                 else:
                     dataset = block.generate(dataset)
