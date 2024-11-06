@@ -270,7 +270,8 @@ def read_taxonomy_leaf_nodes(taxonomy, taxonomy_base, yaml_rules):
     return leaf_nodes
 
 
-def _knowledge_leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count):
+def _knowledge_leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count, sampling_ratio):
+    import random
     samples = []
     # document is the same for the whole leaf node
     chunks = (
@@ -288,7 +289,26 @@ def _knowledge_leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count
 
     for chunk in chunks:
         # pylint: disable=consider-using-enumerate
-        for icl_ in leaf_node:
+        # sampling ratio is a decimal out of 1. 
+        # if ratio == 0.5, that means we drop half of the entries. 
+        # if ratio == 0.75, we drop 25% of the entries
+        dropped_samples = 0
+        leaf_node_len = len(leaf_node)
+        number_to_drop = leaf_node_len - (leaf_node_len * sampling_ratio)
+        # in order to do this randomly we can:
+        # see if there are enough left to meet our quota, if not, DROP THIS ONE
+        # if there are enough, lets randomly choose y or n.
+        # this way, we don't drop the SAME qna pair from each node, as this could lead to some bias
+        for i, icl_ in enumerate(leaf_node):
+            if dropped_samples < number_to_drop:
+                # we need to drop this one.
+                if leaf_node_len - i - 1 <= dropped_samples:
+                    dropped_samples+=1
+                    continue
+                # the regular case: if dropped_samples < number_to_drop, debate dropping this one
+                elif random.choice([True, False]):
+                    dropped_samples+=1
+                    continue
             icl_query = {
                 f"icl_query_{idx+1}": val["question"]
                 for idx, val in enumerate(icl_["questions_and_answers"])
@@ -325,11 +345,11 @@ def _skill_leaf_node_to_samples(leaf_node):
     return samples
 
 
-def leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count):
+def leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count, sampling_ratio):
     if not leaf_node:
         return []
     if leaf_node[0].get("document"):
         return _knowledge_leaf_node_to_samples(
-            leaf_node, server_ctx_size, chunk_word_count
+            leaf_node, server_ctx_size, chunk_word_count, sampling_ratio
         )
     return _skill_leaf_node_to_samples(leaf_node)

@@ -282,6 +282,7 @@ def generate_data(
     pipeline: Optional[str] = "simple",
     batch_size: Optional[int] = None,
     checkpoint_dir: Optional[str] = None,
+    sampling_ratio: float = 1.0
 ) -> None:
     """Generate data for training and testing a model.
 
@@ -362,7 +363,7 @@ def generate_data(
     for leaf_node in leaf_nodes.values():
         is_knowledge = False
         leaf_node_path = leaf_node[0]["taxonomy_path"].replace("->", "_")
-        samples = leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count)
+        samples = leaf_node_to_samples(leaf_node, server_ctx_size, chunk_word_count, sampling_ratio)
 
         if not samples:
             raise GenerateException("Error: No samples found in leaf node.")
